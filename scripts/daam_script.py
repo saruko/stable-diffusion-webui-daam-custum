@@ -15,6 +15,7 @@ from modules.shared import opts
 
 from scripts.daam import trace, utils
 from scripts.daam.anima import AnimaDaamTracer, AnimaPromptAnalyzer
+from scripts.daam.dit import FluxDaamTracer, FluxPromptAnalyzer, LuminaDaamTracer, LuminaPromptAnalyzer
 
 before_image_saved_handler = None
 
@@ -64,6 +65,36 @@ def _get_anima_dit(sd_model):
     if blocks and hasattr(blocks[0], "cross_attn"):
         return diffusion_model
     return None
+
+
+def _get_flux_dit(sd_model):
+    """Return a Flux/Chroma-style DiT ``diffusion_model`` (with double_blocks) or None."""
+    try:
+        diffusion_model = sd_model.forge_objects.unet.model.diffusion_model
+    except AttributeError:
+        return None
+    if getattr(diffusion_model, "double_blocks", None) is not None:
+        return diffusion_model
+    return None
+
+
+def _get_lumina_dit(sd_model):
+    """Return a Lumina 2 (NextDiT) ``diffusion_model`` (with layers + context_refiner) or None."""
+    try:
+        diffusion_model = sd_model.forge_objects.unet.model.diffusion_model
+    except AttributeError:
+        return None
+    if getattr(diffusion_model, "layers", None) is not None and getattr(diffusion_model, "context_refiner", None) is not None:
+        return diffusion_model
+    return None
+
+
+# model_kind -> (diffusion_model getter, tracer class, prompt analyzer class)
+_DIT_MODELS = {
+    "anima": (_get_anima_dit, AnimaDaamTracer, AnimaPromptAnalyzer),
+    "flux": (_get_flux_dit, FluxDaamTracer, FluxPromptAnalyzer),
+    "lumina": (_get_lumina_dit, LuminaDaamTracer, LuminaPromptAnalyzer),
+}
 
 
 class Script(scripts.Script):
@@ -180,6 +211,8 @@ class Script(scripts.Script):
 
         clip_engine = _get_text_engine(p.sd_model)
         anima_engine = getattr(p.sd_model, "text_processing_engine_anima", None)
+        t5_engine = getattr(p.sd_model, "text_processing_engine_t5", None)
+        gemma_engine = getattr(p.sd_model, "text_processing_engine_gemma", None)
 
         if clip_engine is not None and _get_sd_unet(p.sd_model) is not None:
             self.model_kind = "clip"
@@ -187,16 +220,24 @@ class Script(scripts.Script):
         elif anima_engine is not None and _get_anima_dit(p.sd_model) is not None:
             self.model_kind = "anima"
             engine = anima_engine
+        elif t5_engine is not None and _get_flux_dit(p.sd_model) is not None:
+            self.model_kind = "flux"
+            engine = t5_engine
+        elif gemma_engine is not None and _get_lumina_dit(p.sd_model) is not None:
+            self.model_kind = "lumina"
+            engine = gemma_engine
         else:
             print(f"DAAM: unsupported model '{type(p.sd_model).__name__}'. "
-                  f"Supported: SD1.x / SDXL (classic CLIP U-Net) and anima (Cosmos-Predict2 DiT). Skipping.")
+                  f"Supported: SD1.x / SDXL (classic CLIP U-Net), anima (Cosmos-Predict2 DiT), "
+                  f"Flux/Chroma (double-stream DiT) and Lumina 2 (NextDiT). Skipping.")
             self.enabled = False
             return
 
         styled_prompt = prompts[0]
         try:
-            if self.model_kind == "anima":
-                self.prompt_analyzer = AnimaPromptAnalyzer(engine, styled_prompt)
+            if self.model_kind in _DIT_MODELS:
+                analyzer_cls = _DIT_MODELS[self.model_kind][2]
+                self.prompt_analyzer = analyzer_cls(engine, styled_prompt)
             else:
                 self.prompt_analyzer = utils.PromptAnalyzer(engine, styled_prompt)
         except Exception as e:
@@ -215,14 +256,15 @@ class Script(scripts.Script):
         if not getattr(self, "enabled", False) or self.prompt_analyzer is None:
             return
 
-        if self.model_kind == "anima":
-            # anima's SelfCrossAttention does not honor the attn2 patch dict, so we
-            # hook the cross_attn modules on the live diffusion_model directly. The
-            # hooks are removed in postprocess.
-            diffusion_model = _get_anima_dit(p.sd_model)
+        if self.model_kind in _DIT_MODELS:
+            # DiT models (anima, Flux/Chroma, Lumina 2) do not honor the attn2
+            # patch dict, so we hook their attention modules on the live
+            # diffusion_model directly. The hooks are removed in postprocess.
+            getter, tracer_cls, _ = _DIT_MODELS[self.model_kind]
+            diffusion_model = getter(p.sd_model)
             if diffusion_model is None:
                 return
-            tracer = AnimaDaamTracer(
+            tracer = tracer_cls(
                 diffusion_model=diffusion_model,
                 height=p.height,
                 width=p.width,
