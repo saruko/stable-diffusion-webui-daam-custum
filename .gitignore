@@ -1,0 +1,5 @@
+.vscode/
+.env
+.claude/
+
+__pycache__/
